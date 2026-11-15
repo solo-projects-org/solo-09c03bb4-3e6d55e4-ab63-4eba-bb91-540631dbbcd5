@@ -15,6 +15,13 @@ services:
       TOTAL_BUDGET: "${TOTAL_BUDGET:-1}"
       IMPORT_ON_STARTUP: "1"
       SQLITE_BUSY_TIMEOUT_MS: "30000"
+      # Admin ledger verification. The defaults only exist so the Swagger UI
+      # works out of the box locally; set real secrets in any shared
+      # deployment (`ADMIN_TOKEN=... LEDGER_SIGNING_KEY=... docker compose up`).
+      # Changing LEDGER_SIGNING_KEY later does not re-sign existing history:
+      # new releases are refused until the original key is restored.
+      ADMIN_TOKEN: "${ADMIN_TOKEN:-dev-admin-token}"
+      LEDGER_SIGNING_KEY: "${LEDGER_SIGNING_KEY:-dev-ledger-signing-key}"
     volumes:
       # Named volume: the data set, the spent budget and every released answer
       # persist across restarts and `docker compose up` recreations.

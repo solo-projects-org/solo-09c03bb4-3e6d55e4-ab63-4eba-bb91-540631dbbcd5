@@ -54,6 +54,32 @@ CREATE TABLE IF NOT EXISTS requests (
     budget_after  TEXT NOT NULL,
     created_at    TEXT NOT NULL
 );
+
+-- Tamper-evident release ledger: one chained HMAC signature per released
+-- answer, appended in the same transaction as the answer and the budget
+-- deduction.  Rows are never updated or deleted by application code.
+CREATE TABLE IF NOT EXISTS release_ledger (
+    seq            INTEGER PRIMARY KEY CHECK (seq > 0),
+    request_id     TEXT NOT NULL UNIQUE REFERENCES requests (request_id),
+    payload_hash   TEXT NOT NULL,
+    prev_signature TEXT NOT NULL,
+    signature      TEXT NOT NULL,
+    key_id         TEXT NOT NULL,
+    created_at     TEXT NOT NULL
+);
+
+-- Singleton ledger bookkeeping: which key signed the chain, where the tip
+-- is (so deleting trailing rows is detectable) and whether an anomaly has
+-- halted new releases.  The halt flag is persistent on purpose.
+CREATE TABLE IF NOT EXISTS ledger_meta (
+    id              INTEGER PRIMARY KEY CHECK (id = 1),
+    key_fingerprint TEXT,
+    tip_signature   TEXT,
+    ledger_length   INTEGER NOT NULL DEFAULT 0,
+    halted          INTEGER NOT NULL DEFAULT 0,
+    halt_reason     TEXT,
+    halted_at       TEXT
+);
 """
 
 

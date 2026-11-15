@@ -24,6 +24,12 @@ def _env(name: str, default: str) -> str:
     return default if value is None or value.strip() == "" else value
 
 
+def _env_optional(name: str) -> str | None:
+    """An optional secret: unset or blank means "not configured"."""
+    value = os.environ.get(name)
+    return None if value is None or value.strip() == "" else value
+
+
 @dataclass(frozen=True)
 class Settings:
     database_path: Path
@@ -35,6 +41,10 @@ class Settings:
     #: whose write path is serialised by SQLite's ``BEGIN IMMEDIATE``, so this
     #: value documents intent rather than gating anything.
     max_concurrency: int = 4
+    #: Bearer token guarding the admin verification API (``ADMIN_TOKEN``).
+    admin_token: str | None = None
+    #: HMAC key for the signed release ledger (``LEDGER_SIGNING_KEY``).
+    ledger_signing_key: str | None = None
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -49,4 +59,6 @@ class Settings:
             not in {"0", "false", "no"},
             sqlite_busy_timeout_ms=int(_env("SQLITE_BUSY_TIMEOUT_MS", "30000")),
             max_concurrency=max(1, int(_env("MAX_CONCURRENCY", "4"))),
+            admin_token=_env_optional("ADMIN_TOKEN"),
+            ledger_signing_key=_env_optional("LEDGER_SIGNING_KEY"),
         )

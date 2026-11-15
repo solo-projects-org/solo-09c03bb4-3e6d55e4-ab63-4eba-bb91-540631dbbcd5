@@ -93,6 +93,49 @@ Returns the stored answer for a request id (same body as above) or `404`.
 
 Liveness plus whether the data set has been loaded and its row count.
 
+### `POST /v1/admin/verify`
+
+Admin endpoint that re-verifies the **signed release ledger** and halts new
+releases if anything was tampered with. Requires the admin token as a Bearer
+credential (in Swagger: click **Authorize** and paste the token):
+
+```bash
+curl -s -X POST http://localhost:8000/v1/admin/verify \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+```json
+{
+  "status": "ok",
+  "verified_count": 2,
+  "ledger_length": 2,
+  "unsigned_requests": 0,
+  "first_anomaly": null,
+  "releases_halted": false,
+  "halt_reason": null,
+  "detail": "all 2 ledger entries verified with the configured key"
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `status` | `ok` (chain verifies), `tampered` (first anomaly found), `key_mismatch` (configured key is not the key that signed the ledger), `disabled` (no `LEDGER_SIGNING_KEY` configured). |
+| `verified_count` | Ledger entries cryptographically verified before the first anomaly. |
+| `unsigned_requests` | Released answers with no signature (they predate signing). They stay usable but are **never** counted as verified. |
+| `first_anomaly` | `kind`, chain position `seq`, `request_id` and a human-readable `detail` of the first problem, or `null`. |
+| `releases_halted` | Once an anomaly has been seen, this stays `true` — the halt is persisted in the database and survives restarts. |
+
+When `LEDGER_SIGNING_KEY` is set, every **new** answer is appended to
+`release_ledger` in the same transaction as the answer and the budget
+deduction. Each entry HMAC-signs the request id, the query parameters, the
+noisy value and the post-deduction budget, and chains the previous entry's
+signature, so edited, reordered or deleted rows are detected by the walk
+above. After a `tampered` result, new releases are rejected with
+`503 releases_halted`; stored answers remain readable and replayable for
+free. The ledger is append-only: a restart continues the chain, and a
+different signing key is reported (`key_mismatch`) instead of silently
+re-signing history.
+
 ### Errors
 
 All errors share one shape:
@@ -103,10 +146,16 @@ All errors share one shape:
 
 | Status | `error` | When |
 | --- | --- | --- |
+| 401 | `unauthorized` | Missing or wrong admin token on `/v1/admin/verify` |
 | 409 | `request_id_conflict` | Same `request_id`, different parameters |
 | 422 | `invalid_request` | Malformed body, `ε` outside `(0, 1]`, outcome not `0`/`1`, … |
 | 429 | `budget_exhausted` | `ε` does not fit in the remaining global budget |
 | 503 | `dataset_missing` | No data set imported |
+| 503 | `releases_halted` | Ledger verification found an anomaly; new releases stopped (replays still work) |
+| 503 | `ledger_key_mismatch` | `LEDGER_SIGNING_KEY` differs from the key that signed the existing ledger |
+| 503 | `ledger_signing_required` | Database holds a signed ledger but no signing key is configured |
+| 503 | `ledger_inconsistent` | Ledger bookkeeping disagrees with the ledger table |
+| 503 | `admin_disabled` | Admin API called without `ADMIN_TOKEN` configured |
 | 500 | `internal_error` | Unexpected failure; nothing was charged |
 
 ---
@@ -143,6 +192,11 @@ All errors share one shape:
 | Invalid request never charges | Validation happens before the service is called; no row is written. |
 | Save failure never charges, and produces no answer | The noisy draw, the request row and the budget update are one transaction. Any exception rolls back both; `GET /v1/budget` is unchanged. |
 | Commit succeeded but response lost | The answer is durable before the response is written. A retry — even after a restart — returns the identical stored value. |
+| Release ledger is tamper-evident | When signing is enabled, each new answer's ledger entry is committed in the same transaction as the answer and the charge, and chains the previous entry's HMAC. Verification re-walks the chain and reports the first anomaly plus how many entries verified. |
+| Write failure leaves no orphan signature | The signature insert shares the answer's transaction; a failure anywhere rolls back answer, charge and signature together. |
+| Anomaly ⇒ new releases stop | A failed verification persists `ledger_meta.halted`. New releases get `503 releases_halted`; replays and lookups stay free. The flag survives restarts. |
+| Restart or key change never re-signs history | Ledger rows are insert-only and the signing key's fingerprint is stored with the chain. A different key refuses to extend the chain (`503 ledger_key_mismatch`) and verification reports `key_mismatch`; old entries are never rewritten. |
+| Unsigned history stays clearly unsigned | Answers released before signing was enabled keep working, but verification reports them separately as `unsigned_requests` and never counts them as verified. |
 
 ---
 
@@ -162,16 +216,17 @@ pytest -q
 
 ```
 app/
-  config.py     env-driven settings (paths, total budget)
+  config.py     env-driven settings (paths, total budget, admin/ledger secrets)
   db.py         SQLite connections, schema, serialised transactions
   importer.py   validated one-shot CSV import
   privacy.py    Laplace mechanism, canonical decimals, request fingerprints
+  ledger.py     chained HMAC signatures and chain verification
   models.py     dataclasses and the SQL repository (budget critical section)
   service.py    query orchestration and idempotency
   main.py       FastAPI app, endpoints, error mapping
 examples/followup.csv   sample input (same as seed/followup.csv)
 seed/followup.csv       data set imported by the container on first start
-tests/                  pytest suite (API, privacy, concurrency, durability)
+tests/                  pytest suite (API, privacy, ledger, concurrency, durability)
 ```
 
 ### Environment variables
@@ -183,7 +238,16 @@ tests/                  pytest suite (API, privacy, concurrency, durability)
 | `TOTAL_BUDGET` | `1` | Lifetime privacy budget |
 | `IMPORT_ON_STARTUP` | `1` | Set `0` to boot without an import attempt |
 | `SQLITE_BUSY_TIMEOUT_MS` | `30000` | How long writers wait for the lock |
+| `ADMIN_TOKEN` | *(unset)* | Bearer token for `POST /v1/admin/verify`; unset disables the admin API |
+| `LEDGER_SIGNING_KEY` | *(unset)* | HMAC key for the signed release ledger; unset disables signing |
 | `API_PORT` | `8000` | Host port published by Compose |
+
+> The Compose file sets demo values for `ADMIN_TOKEN` and
+> `LEDGER_SIGNING_KEY` so the verification flow works out of the box in
+> Swagger. Override them (`ADMIN_TOKEN=... LEDGER_SIGNING_KEY=... docker
+> compose up`) anywhere real data flows. Once a ledger exists, its key is
+> pinned: a changed `LEDGER_SIGNING_KEY` refuses to extend or re-sign the
+> old chain.
 
 > **Operational note:** every successful new answer consumes budget
 > permanently. To start a fresh study, remove the volume

@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 from .errors import RequestIdConflict
+from .ledger import LedgerSigner
 from .models import ReleaseResult, Repository
 from .privacy import canonical_epsilon, make_noisy_count, request_fingerprint
 
@@ -39,9 +40,17 @@ class QueryOutcome:
 
 
 class QueryService:
-    def __init__(self, repository: Repository, total_budget: Decimal) -> None:
+    def __init__(
+        self,
+        repository: Repository,
+        total_budget: Decimal,
+        signer: LedgerSigner | None = None,
+    ) -> None:
         self._repo = repository
         self._total_budget = total_budget
+        #: When set, every new answer is chained into the signed release
+        #: ledger inside the same transaction as the budget deduction.
+        self._signer = signer
 
     def budget_snapshot(self):
         return self._repo.budget_snapshot()
@@ -76,6 +85,7 @@ class QueryService:
             outcome=outcome,
             epsilon=epsilon,
             noisy_count=released,
+            signer=self._signer,
         )
         if result.replayed:
             # Another request handler committed this id first.  Its answer is

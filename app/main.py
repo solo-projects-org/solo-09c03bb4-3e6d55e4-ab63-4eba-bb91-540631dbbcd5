@@ -6,6 +6,7 @@ Endpoints
 ``GET  /v1/budget``              remaining global privacy budget
 ``POST /v1/counts``              privatized count for one (region, outcome)
 ``GET  /v1/requests/{id}``       look up a previously released answer
+``POST /v1/admin/verify``        admin: verify the signed release ledger
 
 Only noisy counts and budget figures ever leave the process; exact counts are
 never part of any response model.
@@ -13,21 +14,32 @@ never part of any response model.
 
 from __future__ import annotations
 
+import hmac
 import logging
 import re
 from contextlib import asynccontextmanager
 from decimal import Decimal
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Security
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, field_validator
 
 from . import __version__
 from .config import Settings
 from .db import Database
-from .errors import BudgetExhausted, DatasetMissing, RequestIdConflict
+from .errors import (
+    BudgetExhausted,
+    DatasetMissing,
+    LedgerInconsistent,
+    LedgerKeyMismatch,
+    LedgerSigningRequired,
+    ReleaseHalted,
+    RequestIdConflict,
+)
 from .importer import ImportError_, import_csv
+from .ledger import LedgerSigner
 from .models import SqliteRepository
 from .privacy import MIN_EPSILON, canonical_decimal, canonical_epsilon
 from .service import QueryService
@@ -152,13 +164,51 @@ class ErrorBody(BaseModel):
     message: str
 
 
+class AnomalyBody(BaseModel):
+    kind: str = Field(description="Machine-readable anomaly category.")
+    seq: int | None = Field(
+        description="Chain position where verification failed (null for "
+        "tip/bookkeeping anomalies)."
+    )
+    request_id: str | None
+    detail: str
+
+
+class VerifyResponse(BaseModel):
+    status: str = Field(
+        description="ok | tampered | key_mismatch | disabled"
+    )
+    verified_count: int = Field(
+        description="Ledger entries cryptographically verified before the "
+        "first anomaly (if any)."
+    )
+    ledger_length: int = Field(description="Total entries in the ledger.")
+    unsigned_requests: int = Field(
+        description="Released answers with no signature (they predate "
+        "signing); usable, but never counted as verified."
+    )
+    first_anomaly: AnomalyBody | None
+    releases_halted: bool = Field(
+        description="True once an anomaly has persistently halted new releases."
+    )
+    halt_reason: str | None
+    detail: str
+
+
 # --------------------------------------------------------------------------
 # helpers
 # --------------------------------------------------------------------------
-def _error(status: int, code: str, message: str, **extra) -> JSONResponse:
+def _error(
+    status: int,
+    code: str,
+    message: str,
+    headers: dict[str, str] | None = None,
+    **extra,
+) -> JSONResponse:
     return JSONResponse(
         status_code=status,
         content={"error": code, "message": message, **extra},
+        headers=headers,
     )
 
 
@@ -175,7 +225,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
     database = Database(settings.database_path, settings.sqlite_busy_timeout_ms)
     repository = SqliteRepository(database)
-    service = QueryService(repository, settings.total_budget)
+    signer = (
+        LedgerSigner(settings.ledger_signing_key)
+        if settings.ledger_signing_key
+        else None
+    )
+    service = QueryService(repository, settings.total_budget, signer=signer)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -209,7 +264,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "global budget of 1.0. Retrying the same `request_id` with "
             "identical parameters returns the original answer for free; "
             "reusing the id with different parameters is rejected with 409. "
-            "Invalid requests and failed saves never spend budget."
+            "Invalid requests and failed saves never spend budget.\n\n"
+            "When `LEDGER_SIGNING_KEY` is set, every new answer is also "
+            "chained into a signed, tamper-evident release ledger. Admins "
+            "can re-verify the whole ledger via `POST /v1/admin/verify` "
+            "(Bearer token from `ADMIN_TOKEN`); a detected anomaly "
+            "persistently halts new releases while stored answers stay "
+            "readable and replayable."
         ),
         lifespan=lifespan,
     )
@@ -217,6 +278,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.database = database
     app.state.service = service
     app.state.repository = repository
+    app.state.signer = signer
+
+    admin_bearer = HTTPBearer(
+        auto_error=False,
+        scheme_name="AdminToken",
+        description="Admin access token (the `ADMIN_TOKEN` environment variable).",
+    )
 
     # -- endpoints ---------------------------------------------------------
     @app.get(
@@ -261,7 +329,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             409: {"model": ErrorBody, "description": "Request id parameter conflict"},
             422: {"model": ErrorBody, "description": "Invalid request"},
             429: {"model": ErrorBody, "description": "Privacy budget exhausted"},
-            503: {"model": ErrorBody, "description": "No data set imported"},
+            503: {
+                "model": ErrorBody,
+                "description": "No data set imported, releases halted, or "
+                "ledger signing misconfigured",
+            },
         },
     )
     def counts(body: CountQuery):
@@ -282,6 +354,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 f"budget {exc.remaining}",
                 remaining_budget=canonical_decimal(exc.remaining),
             )
+        except ReleaseHalted as exc:
+            return _error(503, "releases_halted", f"new releases are halted: {exc}")
+        except LedgerKeyMismatch as exc:
+            return _error(503, "ledger_key_mismatch", str(exc))
+        except LedgerSigningRequired as exc:
+            return _error(503, "ledger_signing_required", str(exc))
+        except LedgerInconsistent as exc:
+            return _error(503, "ledger_inconsistent", str(exc))
         except DatasetMissing as exc:
             return _error(503, "dataset_missing", str(exc))
 
@@ -319,6 +399,100 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             remaining_budget=canonical_decimal(lookup.remaining_budget),
             replayed=True,
             charged=False,
+        )
+
+    @app.post(
+        "/v1/admin/verify",
+        response_model=VerifyResponse,
+        summary="Verify the signed release ledger (admin)",
+        tags=["admin"],
+        responses={
+            200: {"description": "Verification outcome; inspect `status`"},
+            401: {"model": ErrorBody, "description": "Missing or invalid admin token"},
+            503: {"model": ErrorBody, "description": "Admin API not configured"},
+        },
+    )
+    def verify_release_ledger(
+        credentials: HTTPAuthorizationCredentials | None = Security(admin_bearer),
+    ):
+        if settings.admin_token is None:
+            return _error(
+                503,
+                "admin_disabled",
+                "admin API is not configured; set ADMIN_TOKEN",
+            )
+        if credentials is None or not hmac.compare_digest(
+            credentials.credentials.encode("utf-8"),
+            settings.admin_token.encode("utf-8"),
+        ):
+            return _error(
+                401,
+                "unauthorized",
+                "missing or invalid admin token",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        if signer is None:
+            state = repository.ledger_state()
+            return VerifyResponse(
+                status="disabled",
+                verified_count=0,
+                ledger_length=state.ledger_length,
+                unsigned_requests=state.unsigned_requests,
+                first_anomaly=None,
+                releases_halted=state.halted,
+                halt_reason=state.halt_reason,
+                detail=(
+                    "LEDGER_SIGNING_KEY is not configured; ledger signatures "
+                    "cannot be verified"
+                ),
+            )
+
+        report = repository.verify_and_halt(signer=signer)
+        if report.status == "ok":
+            detail = (
+                f"all {report.verified_count} ledger entries verified with "
+                "the configured key"
+            )
+            if report.unsigned_requests:
+                detail += (
+                    f"; {report.unsigned_requests} released answer(s) predate "
+                    "signing and are not covered by the ledger"
+                )
+            if report.releases_halted:
+                detail += "; releases remain halted from an earlier anomaly"
+        elif report.status == "tampered":
+            anomaly = report.first_anomaly
+            where = (
+                f" at ledger seq {anomaly.seq}" if anomaly.seq is not None else ""
+            )
+            detail = (
+                f"first anomaly{where}: {anomaly.kind} - {anomaly.detail}. "
+                "New releases are halted; stored answers remain readable."
+            )
+        else:  # key_mismatch
+            detail = (
+                "configured signing key does not match the key that signed "
+                "the ledger; existing entries were left untouched"
+            )
+        return VerifyResponse(
+            status=report.status,
+            verified_count=report.verified_count,
+            ledger_length=report.ledger_length,
+            unsigned_requests=report.unsigned_requests,
+            first_anomaly=(
+                AnomalyBody(
+                    kind=report.first_anomaly.kind,
+                    seq=report.first_anomaly.seq,
+                    request_id=report.first_anomaly.request_id,
+                    detail=report.first_anomaly.detail,
+                )
+                if report.first_anomaly
+                else None
+            ),
+            releases_halted=report.releases_halted,
+            halt_reason=report.halt_reason,
+            detail=detail,
         )
 
     # -- uniform error shape ----------------------------------------------

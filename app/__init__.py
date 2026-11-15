@@ -2,11 +2,12 @@
 
 Layout
 ------
-- ``app.config``      runtime settings (paths, budget).
+- ``app.config``      runtime settings (paths, budget, admin/ledger secrets).
 - ``app.db``          SQLite connection helpers, schema, transactions.
 - ``app.importer``    one-shot CSV import.
 - ``app.privacy``     Laplace mechanism and budget bookkeeping.
+- ``app.ledger``      chained HMAC signatures over released answers.
 - ``app.main``        FastAPI application and request handling.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"

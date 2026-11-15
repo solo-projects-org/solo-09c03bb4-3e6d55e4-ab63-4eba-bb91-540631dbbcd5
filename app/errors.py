@@ -29,3 +29,19 @@ class RequestIdConflict(Exception):
         super().__init__(
             f"request id {request_id!r} was already used with different parameters"
         )
+
+
+class ReleaseHalted(Exception):
+    """New releases are halted because ledger verification found an anomaly."""
+
+
+class LedgerKeyMismatch(Exception):
+    """The configured signing key differs from the key that signed the ledger."""
+
+
+class LedgerSigningRequired(Exception):
+    """The database holds a signed ledger but no signing key is configured."""
+
+
+class LedgerInconsistent(Exception):
+    """Ledger bookkeeping disagrees with the ledger table (possible tampering)."""
